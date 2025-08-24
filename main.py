@@ -1,440 +1,661 @@
-# main.py obstacle avoidance v5.41 
-import network, socket, json
-from time import ticks_ms, ticks_us, ticks_diff, sleep_us
+# main.py ds v17-2
+import network
+import socket
+import json
+from time import sleep, ticks_ms, ticks_diff
 from machine import Pin, Timer
 import picobot_motors
 
 # ------------------------
-# Wi-Fi AP
+# AP Setup
 # ------------------------
-SSID = "picobot-oa"
-PASS = "12345678"
+ssid = 'picobot-ln'
+password = '12345678'
 led = Pin("LED", Pin.OUT)
 
 ap = network.WLAN(network.AP_IF)
-ap.config(essid=SSID, password=PASS)
+ap.config(essid=ssid, password=password)
 ap.active(True)
-while not ap.active():
+
+while ap.active() == False:
     pass
-print("AP:", ap.ifconfig())
+
+print('Connection successful')
+print(ap.ifconfig())
 led.on()
 
 # ------------------------
-# Motors
+# Motor driver
 # ------------------------
-motors = picobot_motors.MotorDriver(debug=False)
-
-def forward(speed):
-    for m in ['LeftFront','LeftBack','RightFront','RightBack']:
-        motors.TurnMotor(m,'forward',speed)
-
-def stop_all():
-    motors.StopAllMotors()
-
-def strafe_left(speed):
-    motors.TurnMotor('LeftFront','backward',speed)
-    motors.TurnMotor('LeftBack','forward',speed)
-    motors.TurnMotor('RightFront','forward',speed)
-    motors.TurnMotor('RightBack','backward',speed)
-
-def strafe_right(speed):
-    motors.TurnMotor('LeftFront','forward',speed)
-    motors.TurnMotor('LeftBack','backward',speed)
-    motors.TurnMotor('RightFront','backward',speed)
-    motors.TurnMotor('RightBack','forward',speed)
+motor_driver = picobot_motors.MotorDriver(debug=False)
 
 # ------------------------
-# HC-SR04 (IRQ, non-blocking)
-# Trigger: GP27, Echo: GP26
+# Sensors: right → left
 # ------------------------
-trig = Pin(27, Pin.OUT, value=0)
-echo = Pin(26, Pin.IN)
-
-last_distance = 999         # cm (999 = out of range / invalid)
-_echo_start = 0             # ticks_us at rising edge
-_awaiting_echo = False      # waiting for echo end
-_echo_deadline = 0          # ticks_ms timeout
-
-def _echo_irq(pin):
-    # Single handler for both edges (faster)
-    # Rising: remember start time; Falling: compute width -> distance
-    global _echo_start, last_distance, _awaiting_echo
-    v = pin.value()
-    if v:  # rising
-        _echo_start = ticks_us()
-    else:  # falling
-        if _awaiting_echo:
-            width = ticks_diff(ticks_us(), _echo_start)  # μs
-            # Convert to cm: ~58 us per cm round-trip
-            d = int(width / 58)
-            # Robust range filter: 2..500 cm valid, else 999
-            last_distance = d if 2 <= d <= 500 else 999
-            _awaiting_echo = False
-
-# attach once
-echo.irq(trigger=Pin.IRQ_RISING | Pin.IRQ_FALLING, handler=_echo_irq)
-
-# Timer to fire TRIG and watch timeout (no blocking loops)
-_ultra_tmr = Timer()
-def _ultra_tick(t):
-    global _awaiting_echo, _echo_deadline, last_distance
-    now = ticks_ms()
-    if not _awaiting_echo:
-        # Fire 10 μs pulse
-        trig.off(); sleep_us(2)
-        trig.on();  sleep_us(10)
-        trig.off()
-        _awaiting_echo = True
-        _echo_deadline = now + 50  # 50 ms watchdog
-    else:
-        # Timeout -> mark as out of range, clear wait
-        if ticks_diff(now, _echo_deadline) >= 0:
-            last_distance = 999
-            _awaiting_echo = False
-
-_ultra_tmr.init(period=60, mode=Timer.PERIODIC, callback=_ultra_tick)
+sensors = [
+    Pin(8, Pin.IN, Pin.PULL_UP),   # Right
+    Pin(9, Pin.IN, Pin.PULL_UP),   # Right-middle
+    Pin(13, Pin.IN, Pin.PULL_UP),  # Center
+    Pin(14, Pin.IN, Pin.PULL_UP),  # Left-middle
+    Pin(15, Pin.IN, Pin.PULL_UP)   # Left
+]
 
 # ------------------------
-# Mission State
+# Global variables
 # ------------------------
 robot_running = False
 mission_done = False
-obstacles_cleared = 0
-state = "IDLE"
+line_lost = False
+line_lost_time = 0
+last_direction = "FORWARD"
+search_intensity = 1.0  # Start with normal intensity
 
-# Tunables (defaults)
-base_speed = 50           # 0..100
-initial_dir = "LEFT"      # "LEFT" or "RIGHT"
-strafe_time = 1300        # ms to keep strafing after line-of-sight clears
-num_obstacles = 3
-finish_time = 1000        # ms after last obstacle
-avoid_distance = 10       # cm distance to obstacle to avoid
-
-# ------------------------
-# Avoidance state machine (lightweight, non-blocking)
-# ------------------------
-_state_since = ticks_ms()
-
-def _go_state(new_state):
-    global state, _state_since
-    state = new_state
-    _state_since = ticks_ms()
-
-def _should_strafe_left_for_this_obstacle(idx, initdir):
-    # Alternate directions each obstacle, starting with initdir
-    if initdir == "LEFT":
-        return (idx % 2) == 0
-    else:
-        return (idx % 2) == 1
-
-_loop_tmr = Timer()
-def _loop_tick(t):
-    global robot_running, mission_done, obstacles_cleared
-    if not robot_running or mission_done:
-        stop_all()
-        return
-
-    now = ticks_ms()
-
-    if state == "FORWARD":
-        forward(base_speed)
-        if last_distance < avoid_distance:  # obstacle detected
-            if _should_strafe_left_for_this_obstacle(obstacles_cleared, initial_dir):
-                strafe_left(base_speed)
-                _go_state("STRAFE_LEFT")
-            else:
-                strafe_right(base_speed)
-                _go_state("STRAFE_RIGHT")
-
-    elif state == "STRAFE_LEFT":
-        # Keep strafing while obstacle in front OR until grace ms expires after it clears
-        strafe_left(base_speed)
-        if last_distance >= avoid_distance and ticks_diff(now, _state_since) >= strafe_time:
-            obstacles_cleared += 1
-            if obstacles_cleared >= num_obstacles:
-                forward(base_speed)
-                _go_state("FINISH")
-            else:
-                _go_state("FORWARD")
-
-    elif state == "STRAFE_RIGHT":
-        strafe_right(base_speed)
-        if last_distance >= avoid_distance and ticks_diff(now, _state_since) >= strafe_time:
-            obstacles_cleared += 1
-            if obstacles_cleared >= num_obstacles:
-                forward(base_speed)
-                _go_state("FINISH")
-            else:
-                _go_state("FORWARD")
-
-    elif state == "FINISH":
-        forward(base_speed)
-        if ticks_diff(now, _state_since) >= finish_time:
-            stop_all()
-            mission_done = True
-            robot_running = False
-
-# 50 ms logic tick
-_loop_tmr.init(period=50, mode=Timer.PERIODIC, callback=_loop_tick)
+# Default parameters
+base_speed = 30
+slight_ratio = 0.9
+mild_ratio = 0.75
+hard_ratio = 0.6
+grace_period = 800  # Increased grace period for sharp turns
+search_ratio = 0.4  # Ratio for aggressive searching
 
 # ------------------------
-# HTML (mobile-friendly, touch-sized)
+# HTML and JS content
 # ------------------------
-HTML = """<!DOCTYPE html>
-<html>
+html_content = """<!DOCTYPE html>
+<html lang="en">
 <head>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>PicoBot OA</title>
-<style>
-  :root{ --ok:#4caf50; --stop:#f44336; --done:#2196f3; --card:#fff; --bg:#f3f4f6; }
-  body{ margin:0; font-family:Arial,Helvetica,sans-serif; background:var(--bg); }
-  .wrap{ max-width:820px; margin:0 auto; padding:16px; }
-  h1{ font-size:28px; margin:0 0 12px; text-align:center; }
-  .status{ background:var(--card); border-radius:14px; padding:16px; box-shadow:0 4px 12px rgba(0,0,0,.08); margin-bottom:14px; }
-  .badge{ display:inline-block; padding:6px 12px; border-radius:999px; color:#fff; font-weight:bold; font-size:16px; }
-  .ok{ background:var(--ok); } .stop{ background:var(--stop);} .done{ background:var(--done); }
-  .grid{ display:grid; grid-template-columns:1fr 1fr; gap:10px; }
-  .cell{ background:#fff; border-radius:12px; padding:14px; font-size:18px; }
-  .big{ font-size:24px; font-weight:bold; }
-  .controls{ display:flex; gap:12px; justify-content:space-between; margin:12px 0; }
-  button{ flex:1; padding:18px; font-size:22px; border:none; border-radius:12px; color:#fff; }
-  .start{ background:var(--ok); } .stopbtn{ background:var(--stop); }
-  .params{ background:#fff; border-radius:12px; padding:14px; box-shadow:0 4px 12px rgba(0,0,0,.08); }
-  .row{ display:flex; align-items:center; justify-content:space-between; padding:10px 0; font-size:18px; }
-  input, select{ font-size:20px; padding:8px 10px; width:160px; text-align:center; }
-  .save{ width:100%; margin-top:8px; padding:16px; border:none; border-radius:12px; background:#000; color:#fff; font-size:20px; }
-  .hint{ font-size:14px; color:#666; text-align:center; margin-top:8px; }
-</style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PicoBot Line Follower</title>
+<link rel="stylesheet" href="/style.css">
 </head>
 <body>
-<div class="wrap">
-  <h1>Obstacle Avoidance</h1>
+<h1>PicoBot Line Follower</h1>
 
-  <div class="status">
-    <div id="badge" class="badge stop">Stopped</div>
-    <div class="grid" style="margin-top:12px;">
-      <div class="cell">Distance<br><span id="dist" class="big">-</span> cm</div>
-      <div class="cell">State<br><span id="st" class="big">IDLE</span></div>
-      <div class="cell">Progress<br><span id="prog" class="big">0/0</span></div>
-      <div class="cell">Message<br><span id="msg" class="big">Ready</span></div>
+<div class="status-panel">
+    <div class="section-title">Robot Status</div>
+    <div class="sensor-container">
+        <div class="sensor-box" id="left">L</div>
+        <div class="sensor-box" id="lmid">LM</div>
+        <div class="sensor-box" id="center">C</div>
+        <div class="sensor-box" id="rmid">RM</div>
+        <div class="sensor-box" id="right">R</div>
     </div>
-  </div>
-
-  <div class="controls">
-    <button class="start" onclick="startRobot()">START</button>
-    <button class="stopbtn" onclick="stopRobot()">STOP</button>
-  </div>
-
-  <div class="params">
-    <div class="row"><span>Speed (0-100)</span><input type="number" id="speed" value="50" min="0" max="100"></div>
-    <div class="row"><span>Initial direction</span>
-      <select id="initdir"><option value="LEFT">LEFT</option><option value="RIGHT">RIGHT</option></select>
+    <div class="status-container">
+        <div id="action">Action: -</div>
+        <div id="status">Status: -</div>
     </div>
-    <div class="row"><span>Strafe clear (ms)</span><input type="number" id="strafe" value="1300" min="0"></div>
-    <div class="row"><span># Obstacles</span><input type="number" id="numobs" value="3" min="1"></div>
-    <div class="row"><span>Finish run (ms)</span><input type="number" id="finish" value="1000" min="0"></div>
-    <div class="row"><span>Avoid distance (cm)</span><input type="number" id="avoid" value="10" min="2" max="500"></div>
-    <button class="save" onclick="updateParams()">Update Parameters</button>
-    <div class="hint">Tip: 999 cm = out of range / no echo</div>
-  </div>
 </div>
 
-<script>
-function qs(id){return document.getElementById(id)}
-function encodeParams(obj){return Object.keys(obj).map(k=>k+"="+encodeURIComponent(obj[k])).join("&")}
+<div class="control-panel">
+    <div class="section-title">Robot Control</div>
+    <div>
+        <button class="start-btn" id="startBtn">START</button>
+        <button class="stop-btn" id="stopBtn">STOP</button>
+    </div>
+    <div class="section-title">Adjustments</div>
+    <div class="param-group">
+        <div class="param"><div class="label">Speed</div><input type="number" id="speed" value="30" min="0" max="100"></div>
+        <div class="param"><div class="label">Slight</div><input type="number" id="slight" value="0.9" step="0.05" min="0" max="1"></div>
+        <div class="param"><div class="label">Mild</div><input type="number" id="mild" value="0.75" step="0.05" min="0" max="1"></div>
+        <div class="param"><div class="label">Hard</div><input type="number" id="hard" value="0.6" step="0.05" min="0" max="1"></div>
+        <div class="param"><div class="label">Grace (ms)</div><input type="number" id="grace" value="800" min="0" max="5000"></div>
+        <div class="param"><div class="label">Search</div><input type="number" id="search" value="0.4" step="0.05" min="0" max="1"></div>
+    </div>
+    <button class="update-btn" id="updateBtn">Update Parameters</button>
+</div>
 
-function paintBadge(running, done){
-  const b = qs("badge");
-  if (running){ b.className="badge ok"; b.textContent="Running"; }
-  else if (done){ b.className="badge done"; b.textContent="Mission Done"; }
-  else { b.className="badge stop"; b.textContent="Stopped"; }
-}
-
-async function startRobot(){
-  const q = encodeParams({
-    action:"start",
-    speed:qs("speed").value, dir:qs("initdir").value,
-    strafe:qs("strafe").value, num:qs("numobs").value, finish:qs("finish").value,
-    avoid:qs("avoid").value
-  });
-  try{
-    const r = await fetch("/?"+q); const t = await r.text();
-    qs("msg").textContent = t || "Started";
-  }catch(e){ qs("msg").textContent = "Start failed"; }
-}
-
-async function stopRobot(){
-  try{
-    const r = await fetch("/?action=stop"); const t = await r.text();
-    qs("msg").textContent = t || "Stopped";
-    // Reset progress display
-    setTimeout(() => { qs("prog").textContent = "0/0"; }, 100);
-  }catch(e){ qs("msg").textContent = "Stop failed"; }
-}
-
-async function updateParams(){
-  const q = encodeParams({
-    action:"update",
-    speed:qs("speed").value, dir:qs("initdir").value,
-    strafe:qs("strafe").value, num:qs("numobs").value, finish:qs("finish").value,
-    avoid:qs("avoid").value
-  });
-  try{
-    const r = await fetch("/?"+q); const t = await r.text();
-    qs("msg").textContent = t || "Settings Updated";
-  }catch(e){ qs("msg").textContent = "Update failed"; }
-}
-
-async function poll(){
-  try{
-    const r = await fetch("/status", {cache:"no-store"});
-    const data = await r.json();
-    qs("dist").textContent = data.distance;
-    qs("st").textContent = data.state === "FINISH" ? "Finished" : 
-                          data.state === "IDLE" ? "Ready" : data.state;
-    qs("prog").textContent = (data.cleared||0) + "/" + (data.total||0);
-    paintBadge(data.running, data.done);
-  }catch(e){
-    // show a lightweight hint; avoid throwing to console repeatedly
-    qs("msg").textContent = "status: offline";
-  }
-}
-setInterval(poll, 500);
-poll();
-</script>
+<script src="/script.js"></script>
 </body>
-</html>
-"""
+</html>"""
+
+css_content = """body { 
+    font-family: Arial, sans-serif; 
+    text-align: center; 
+    margin: 0;
+    padding: 10px;
+    background-color: #f0f0f0;
+}
+.status-panel {
+    background-color: white;
+    padding: 15px;
+    border-radius: 10px;
+    box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+    margin-bottom: 15px;
+}
+.control-panel {
+    background-color: white;
+    padding: 15px;
+    border-radius: 10px;
+    box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+    margin-bottom: 15px;
+}
+.param-group {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 10px;
+    margin: 10px 0;
+}
+.param {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-width: 80px;
+}
+button { 
+    font-size: 1.5em; 
+    padding: 15px 30px; 
+    margin: 10px;
+    min-width: 120px;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+}
+.start-btn {
+    background-color: #4CAF50;
+    color: white;
+}
+.stop-btn {
+    background-color: #f44336;
+    color: white;
+}
+.update-btn {
+    background-color: #2196F3;
+    color: white;
+    font-size: 1.2em;
+    padding: 10px 20px;
+}
+input[type=number] { 
+    font-size: 1.2em; 
+    width: 80px; 
+    text-align: center;
+    padding: 5px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+}
+.sensor-container {
+    display: flex;
+    justify-content: center;
+    flex-wrap: wrap;
+    margin: 15px 0;
+}
+.sensor-box { 
+    width: 50px; 
+    height: 50px; 
+    line-height: 50px; 
+    margin: 5px; 
+    border: 2px solid #000; 
+    font-weight: bold; 
+    font-size: 1.2em;
+    border-radius: 8px;
+}
+.status-container {
+    margin: 15px 0;
+    font-size: 1.2em;
+}
+#action, #status {
+    margin: 8px 0;
+    font-weight: bold;
+    padding: 8px;
+    border-radius: 5px;
+    background-color: #f8f8f8;
+}
+.label {
+    font-weight: bold;
+    margin-bottom: 5px;
+    font-size: 0.9em;
+}
+.section-title {
+    font-size: 1.3em;
+    font-weight: bold;
+    margin: 10px 0;
+    color: #333;
+}"""
+
+js_content = """// Initialize with current parameters
+function loadParams() {
+    fetch("/sensors")
+    .then(response => response.json())
+    .then(data => {
+        if (data.params) {
+            document.getElementById("speed").value = data.params.speed || 30;
+            document.getElementById("slight").value = data.params.slight || 0.9;
+            document.getElementById("mild").value = data.params.mild || 0.75;
+            document.getElementById("hard").value = data.params.hard || 0.6;
+            document.getElementById("grace").value = data.params.grace || 800;
+            document.getElementById("search").value = data.params.search || 0.4;
+        }
+    })
+    .catch(err => console.log("Error loading params:", err));
+}
+
+function startRobot() {
+    const speed = document.getElementById("speed").value;
+    const slight = document.getElementById("slight").value;
+    const mild = document.getElementById("mild").value;
+    const hard = document.getElementById("hard").value;
+    const grace = document.getElementById("grace").value;
+    const search = document.getElementById("search").value;
+    
+    fetch("/?action=start&speed=" + speed + "&slight=" + slight + "&mild=" + mild + "&hard=" + hard + "&grace=" + grace + "&search=" + search);
+}
+
+function stopRobot() {
+    fetch("/?action=stop");
+}
+
+function updateParams() {
+    const speed = document.getElementById("speed").value;
+    const slight = document.getElementById("slight").value;
+    const mild = document.getElementById("mild").value;
+    const hard = document.getElementById("hard").value;
+    const grace = document.getElementById("grace").value;
+    const search = document.getElementById("search").value;
+    
+    fetch("/?action=update&speed=" + speed + "&slight=" + slight + "&mild=" + mild + "&hard=" + hard + "&grace=" + grace + "&search=" + search);
+}
+
+function updateSensors() {
+    fetch("/sensors")
+    .then(response => response.json())
+    .then(data => {
+        let vals = data.sensors;
+        document.getElementById("left").style.backgroundColor = vals[4]==1?"green":"white";
+        document.getElementById("lmid").style.backgroundColor = vals[3]==1?"green":"white";
+        document.getElementById("center").style.backgroundColor = vals[2]==1?"green":"white";
+        document.getElementById("rmid").style.backgroundColor = vals[1]==1?"green":"white";
+        document.getElementById("right").style.backgroundColor = vals[0]==1?"green":"white";
+
+        document.getElementById("action").innerText = "Action: "+data.action;
+        document.getElementById("status").innerText = "Status: "+data.status;
+        
+        // Color code the status based on state
+        const statusElem = document.getElementById("status");
+        if (data.status.includes("Running")) {
+            statusElem.style.color = "green";
+        } else if (data.status.includes("Stopped") || data.status.includes("Mission accomplished")) {
+            statusElem.style.color = "blue";
+        } else if (data.status.includes("lost")) {
+            statusElem.style.color = "orange";
+        } else {
+            statusElem.style.color = "black";
+        }
+    })
+    .catch(err => console.log("Sensor update error:", err));
+}
+
+// Set up event listeners
+document.getElementById("startBtn").addEventListener("click", startRobot);
+document.getElementById("stopBtn").addEventListener("click", stopRobot);
+document.getElementById("updateBtn").addEventListener("click", updateParams);
+
+// Load parameters on page load and poll sensors every 200ms
+window.addEventListener("load", function() {
+    loadParams();
+    setInterval(updateSensors, 200);
+});"""
 
 # ------------------------
-# HTTP server (simple, fast)
+# Decide action
 # ------------------------
-def _open_socket(ip):
+def decide_action(sensor_values):
+    if all(v == 1 for v in sensor_values):
+        return "ON JUNCTION"
+    if all(v == 0 for v in sensor_values):
+        return "LINE LOST"
+    
+    positions = [2, 1, 0, -1, -2]
+    weighted_sum = 0
+    active_sensors = 0
+    
+    for i in range(5):
+        if sensor_values[i] == 1:
+            weighted_sum += positions[i]
+            active_sensors += 1
+    
+    if active_sensors > 0:
+        weighted_sum = weighted_sum / active_sensors
+    
+    if weighted_sum > 1.2:
+        return "HARD RIGHT"
+    elif weighted_sum > 0.6:
+        return "MILD RIGHT"
+    elif weighted_sum > 0.2:
+        return "SLIGHT RIGHT"
+    elif weighted_sum < -1.2:
+        return "HARD LEFT"
+    elif weighted_sum < -0.6:
+        return "MILD LEFT"
+    elif weighted_sum < -0.2:
+        return "SLIGHT LEFT"
+    elif weighted_sum == 0 and any(v == 1 for v in sensor_values):
+        return "FORWARD"
+    else:
+        return "SEARCHING"
+
+# ------------------------
+# Map action to motor speeds with aggressive line loss recovery
+# ------------------------
+def set_motor_action(action):
+    global last_direction, search_intensity
+    
+    if action == "FORWARD":
+        motor_driver.TurnMotor('LeftFront', 'forward', base_speed)
+        motor_driver.TurnMotor('LeftBack', 'forward', base_speed)
+        motor_driver.TurnMotor('RightFront', 'forward', base_speed)
+        motor_driver.TurnMotor('RightBack', 'forward', base_speed)
+        search_intensity = 1.0  # Reset search intensity
+        
+    elif action == "SLIGHT RIGHT":
+        motor_driver.TurnMotor('LeftFront', 'forward', base_speed)
+        motor_driver.TurnMotor('LeftBack', 'forward', base_speed)
+        motor_driver.TurnMotor('RightFront', 'forward', int(base_speed * slight_ratio))
+        motor_driver.TurnMotor('RightBack', 'forward', int(base_speed * slight_ratio))
+        search_intensity = 1.0  # Reset search intensity
+        
+    elif action == "MILD RIGHT":
+        motor_driver.TurnMotor('LeftFront', 'forward', base_speed)
+        motor_driver.TurnMotor('LeftBack', 'forward', base_speed)
+        motor_driver.TurnMotor('RightFront', 'forward', int(base_speed * mild_ratio))
+        motor_driver.TurnMotor('RightBack', 'forward', int(base_speed * mild_ratio))
+        search_intensity = 1.0  # Reset search intensity
+        
+    elif action == "HARD RIGHT":
+        motor_driver.TurnMotor('LeftFront', 'forward', base_speed)
+        motor_driver.TurnMotor('LeftBack', 'forward', base_speed)
+        motor_driver.TurnMotor('RightFront', 'forward', int(base_speed * hard_ratio))
+        motor_driver.TurnMotor('RightBack', 'forward', int(base_speed * hard_ratio))
+        search_intensity = 1.0  # Reset search intensity
+        
+    elif action == "SLIGHT LEFT":
+        motor_driver.TurnMotor('LeftFront', 'forward', int(base_speed * slight_ratio))
+        motor_driver.TurnMotor('LeftBack', 'forward', int(base_speed * slight_ratio))
+        motor_driver.TurnMotor('RightFront', 'forward', base_speed)
+        motor_driver.TurnMotor('RightBack', 'forward', base_speed)
+        search_intensity = 1.0  # Reset search intensity
+        
+    elif action == "MILD LEFT":
+        motor_driver.TurnMotor('LeftFront', 'forward', int(base_speed * mild_ratio))
+        motor_driver.TurnMotor('LeftBack', 'forward', int(base_speed * mild_ratio))
+        motor_driver.TurnMotor('RightFront', 'forward', base_speed)
+        motor_driver.TurnMotor('RightBack', 'forward', base_speed)
+        search_intensity = 1.0  # Reset search intensity
+        
+    elif action == "HARD LEFT":
+        motor_driver.TurnMotor('LeftFront', 'forward', int(base_speed * hard_ratio))
+        motor_driver.TurnMotor('LeftBack', 'forward', int(base_speed * hard_ratio))
+        motor_driver.TurnMotor('RightFront', 'forward', base_speed)
+        motor_driver.TurnMotor('RightBack', 'forward', base_speed)
+        search_intensity = 1.0  # Reset search intensity
+        
+    elif action == "ON JUNCTION":
+        motor_driver.StopAllMotors()
+        search_intensity = 1.0  # Reset search intensity
+        
+    elif action == "LINE LOST":
+        # Increase search intensity each time we lose the line for sharper turns
+        search_intensity *= 1.5
+        
+        # Aggressive turning when line is lost - much sharper turns
+        if ticks_diff(ticks_ms(), line_lost_time) < grace_period:
+            if "RIGHT" in last_direction:
+                # Very sharp right turn search
+                turn_speed = int(base_speed * search_ratio * search_intensity)
+                motor_driver.TurnMotor('LeftFront', 'forward', turn_speed)
+                motor_driver.TurnMotor('LeftBack', 'forward', turn_speed)
+                motor_driver.TurnMotor('RightFront', 'backward', turn_speed)
+                motor_driver.TurnMotor('RightBack', 'backward', turn_speed)
+            elif "LEFT" in last_direction:
+                # Very sharp left turn search
+                turn_speed = int(base_speed * search_ratio * search_intensity)
+                motor_driver.TurnMotor('LeftFront', 'backward', turn_speed)
+                motor_driver.TurnMotor('LeftBack', 'backward', turn_speed)
+                motor_driver.TurnMotor('RightFront', 'forward', turn_speed)
+                motor_driver.TurnMotor('RightBack', 'forward', turn_speed)
+            else:
+                # Forward was last direction, do gentle search
+                set_motor_action(last_direction)
+        else:
+            motor_driver.StopAllMotors()
+            search_intensity = 1.0  # Reset search intensity
+            
+    elif action == "SEARCHING":
+        # Use the same aggressive search pattern as LINE LOST
+        if ticks_diff(ticks_ms(), line_lost_time) < grace_period:
+            if "RIGHT" in last_direction:
+                turn_speed = int(base_speed * search_ratio * search_intensity)
+                motor_driver.TurnMotor('LeftFront', 'forward', turn_speed)
+                motor_driver.TurnMotor('LeftBack', 'forward', turn_speed)
+                motor_driver.TurnMotor('RightFront', 'backward', turn_speed)
+                motor_driver.TurnMotor('RightBack', 'backward', turn_speed)
+            elif "LEFT" in last_direction:
+                turn_speed = int(base_speed * search_ratio * search_intensity)
+                motor_driver.TurnMotor('LeftFront', 'backward', turn_speed)
+                motor_driver.TurnMotor('LeftBack', 'backward', turn_speed)
+                motor_driver.TurnMotor('RightFront', 'forward', turn_speed)
+                motor_driver.TurnMotor('RightBack', 'forward', turn_speed)
+            else:
+                set_motor_action(last_direction)
+        else:
+            motor_driver.StopAllMotors()
+            search_intensity = 1.0  # Reset search intensity
+    
+    # Update last direction if not line lost or searching
+    if action not in ["LINE LOST", "SEARCHING"]:
+        last_direction = action
+
+# ------------------------
+# Open socket
+# ------------------------
+def open_socket(ip):
     addr = socket.getaddrinfo(ip, 80)[0][-1]
     s = socket.socket()
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(addr)
-    s.listen(2)
+    s.listen(1)
     return s
 
-sock = _open_socket(ap.ifconfig()[0])
-print("HTTP listening on", ap.ifconfig()[0])
+# ------------------------
+# Main
+# ------------------------
+ap_ip = ap.ifconfig()[0]
+sock = open_socket(ap_ip)
+print("Server running on:", ap_ip)
 
-def _send(client, status="200 OK", ctype="text/plain", body="OK"):
-    try:
-        client.send("HTTP/1.1 %s\r\nContent-Type: %s\r\nCache-Control: no-store\r\n\r\n" % (status, ctype))
-        if isinstance(body, bytes):
-            client.send(body)
+# Timer for line following
+line_follow_timer = Timer()
+
+def line_follow_callback(timer):
+    global robot_running, mission_done, line_lost, line_lost_time
+    
+    if not robot_running:
+        return
+        
+    vals = [s.value() for s in sensors]
+    act = decide_action(vals)
+    
+    if act == "ON JUNCTION":
+        motor_driver.StopAllMotors()
+        mission_done = True
+        robot_running = False
+        print("Mission accomplished - at junction")
+        
+    elif act == "LINE LOST":
+        if not line_lost:
+            line_lost = True
+            line_lost_time = ticks_ms()
+            print("Line lost - starting aggressive search")
+        elif ticks_diff(ticks_ms(), line_lost_time) >= grace_period:
+            motor_driver.StopAllMotors()
+            print("Line lost - stopped after grace period")
         else:
-            client.send(body)
-    except:
-        pass
-    try:
-        client.close()
-    except:
-        pass
+            # Continue with aggressive search during grace period
+            set_motor_action(act)
+            
+    else:
+        if line_lost:
+            line_lost = False
+            print("Line found - resuming normal operation")
+        
+        # Set motors based on action
+        set_motor_action(act)
+    
+    print("Sensors:", vals, "Action:", act, "Search intensity:", search_intensity)
 
-def _parse_query(req_line):
-    # very small query parser for GET /?... HTTP/1.1
-    params = {}
-    try:
-        q = req_line.split(' ')[1]
-        if '?' in q:
-            qs = q.split('?',1)[1]
-            for pair in qs.split('&'):
-                if '=' in pair:
-                    k,v = pair.split('=',1)
-                    params[k] = v
-    except:
-        pass
-    return params
+line_follow_timer.init(period=50, mode=Timer.PERIODIC, callback=line_follow_callback)
 
-# ------------------------
-# Main service loop (non-blocking per request)
-# ------------------------
 while True:
-    client, addr = sock.accept()
-    req = client.recv(1024)
-    if not req:
-        client.close()
-        continue
     try:
-        req = req.decode()
-    except:
-        client.close(); continue
+        client, addr = sock.accept()
+        request = client.recv(1024)
+        request_str = request.decode()
+        print("Request:", request_str)
 
-    # First line only
-    first = req.split('\r\n',1)[0]
+        # Handle sensor requests
+        if "GET /sensors" in request_str:
+            vals = [s.value() for s in sensors]
+            act = decide_action(vals)
+            
+            if mission_done:
+                status = "Mission accomplished"
+            elif line_lost and ticks_diff(ticks_ms(), line_lost_time) >= grace_period:
+                status = "Line lost - stopped"
+            elif line_lost:
+                status = "Line lost - searching"
+            elif robot_running:
+                status = "Running"
+            else:
+                status = "Stopped"
 
-    # Status endpoint (fast JSON)
-    if first.startswith("GET /status"):
-        data = {
-            "running": robot_running,
-            "done": mission_done,
-            "distance": last_distance,
-            "state": state,
-            "cleared": obstacles_cleared,
-            "total": num_obstacles
-        }
-        _send(client, ctype="application/json", body=json.dumps(data))
-        continue
-
-    # Actions
-    if first.startswith("GET /?"):
-        q = _parse_query(first)
-
-        action = q.get("action","")
-        resp = "OK"
-
-        if action == "start":
-            # Update params if provided
-            try:
-                if "speed" in q:  base_speed = int(q["speed"])
-                if "dir"   in q:  initial_dir = q["dir"].upper()
-                if "strafe"in q:  strafe_time = int(q["strafe"])
-                if "num"   in q:  num_obstacles = int(q["num"])
-                if "finish"in q:  finish_time = int(q["finish"])
-                if "avoid" in q:  avoid_distance = int(q["avoid"])
-            except Exception as e:
-                print("Error parsing parameters:", e)
-
-            mission_done = False
-            obstacles_cleared = 0
-            _go_state("FORWARD")
+            data = {
+                'sensors': vals, 
+                'action': act, 
+                'status': status,
+                'params': {
+                    'speed': base_speed,
+                    'slight': slight_ratio,
+                    'mild': mild_ratio,
+                    'hard': hard_ratio,
+                    'grace': grace_period,
+                    'search': search_ratio
+                }
+            }
+            
+            # Proper HTTP response with CORS headers
+            response = "HTTP/1.1 200 OK\r\n"
+            response += "Content-Type: application/json\r\n"
+            response += "Access-Control-Allow-Origin: *\r\n"
+            response += "Connection: close\r\n\r\n"
+            response += json.dumps(data)
+            
+            client.send(response.encode())
+            
+        # Handle control actions
+        elif "GET /?action=start" in request_str:
             robot_running = True
-            resp = "Started"
-
-        elif action == "stop":
-            robot_running = False
             mission_done = False
-            obstacles_cleared = 0
-            _go_state("IDLE")
-            stop_all()
-            resp = "Stopped"
-
-        elif action == "update":
-            try:
-                if "speed" in q:  base_speed = int(q["speed"])
-                if "dir"   in q:  initial_dir = q["dir"].upper()
-                if "strafe"in q:  strafe_time = int(q["strafe"])
-                if "num"   in q:  num_obstacles = int(q["num"])
-                if "finish"in q:  finish_time = int(q["finish"])
-                if "avoid" in q:  avoid_distance = int(q["avoid"])
-                resp = "Settings Updated"
-            except Exception as e:
-                resp = "ERR - Bad Parameters"
-                print("Error updating parameters:", e)
-
+            line_lost = False
+            search_intensity = 1.0  # Reset search intensity
+            
+            # Extract parameters
+            if "speed=" in request_str:
+                base_speed = int(request_str.split("speed=")[1].split("&")[0])
+            if "slight=" in request_str:
+                slight_ratio = float(request_str.split("slight=")[1].split("&")[0])
+            if "mild=" in request_str:
+                mild_ratio = float(request_str.split("mild=")[1].split("&")[0])
+            if "hard=" in request_str:
+                hard_ratio = float(request_str.split("hard=")[1].split("&")[0])
+            if "grace=" in request_str:
+                grace_period = int(request_str.split("grace=")[1].split("&")[0])
+            if "search=" in request_str:
+                search_ratio = float(request_str.split("search=")[1].split("&")[0])
+            
+            print(f"Starting with speed={base_speed}, ratios: slight={slight_ratio}, mild={mild_ratio}, hard={hard_ratio}, grace={grace_period}, search={search_ratio}")
+            
+            response = "HTTP/1.1 200 OK\r\n"
+            response += "Content-Type: text/plain\r\n"
+            response += "Access-Control-Allow-Origin: *\r\n"
+            response += "Connection: close\r\n\r\n"
+            response += "OK"
+            
+            client.send(response.encode())
+            
+        elif "GET /?action=stop" in request_str:
+            robot_running = False
+            motor_driver.StopAllMotors()
+            search_intensity = 1.0  # Reset search intensity
+            print("Stopped by user")
+            
+            response = "HTTP/1.1 200 OK\r\n"
+            response += "Content-Type: text/plain\r\n"
+            response += "Access-Control-Allow-Origin: *\r\n"
+            response += "Connection: close\r\n\r\n"
+            response += "OK"
+            
+            client.send(response.encode())
+            
+        elif "GET /?action=update" in request_str:
+            # Update parameters without starting the robot
+            if "speed=" in request_str:
+                base_speed = int(request_str.split("speed=")[1].split("&")[0])
+            if "slight=" in request_str:
+                slight_ratio = float(request_str.split("slight=")[1].split("&")[0])
+            if "mild=" in request_str:
+                mild_ratio = float(request_str.split("mild=")[1].split("&")[0])
+            if "hard=" in request_str:
+                hard_ratio = float(request_str.split("hard=")[1].split("&")[0])
+            if "grace=" in request_str:
+                grace_period = int(request_str.split("grace=")[1].split("&")[0])
+            if "search=" in request_str:
+                search_ratio = float(request_str.split("search=")[1].split("&")[0])
+            
+            print(f"Updated parameters: speed={base_speed}, ratios: slight={slight_ratio}, mild={mild_ratio}, hard={hard_ratio}, grace={grace_period}, search={search_ratio}")
+            
+            response = "HTTP/1.1 200 OK\r\n"
+            response += "Content-Type: text/plain\r\n"
+            response += "Access-Control-Allow-Origin: *\r\n"
+            response += "Connection: close\r\n\r\n"
+            response += "OK"
+            
+            client.send(response.encode())
+            
+        # Serve CSS file
+        elif "GET /style.css" in request_str:
+            response = "HTTP/1.1 200 OK\r\n"
+            response += "Content-Type: text/css\r\n"
+            response += "Access-Control-Allow-Origin: *\r\n"
+            response += "Connection: close\r\n\r\n"
+            response += css_content
+            
+            client.send(response.encode())
+            
+        # Serve JavaScript file
+        elif "GET /script.js" in request_str:
+            response = "HTTP/1.1 200 OK\r\n"
+            response += "Content-Type: application/javascript\r\n"
+            response += "Access-Control-Allow-Origin: *\r\n"
+            response += "Connection: close\r\n\r\n"
+            response += js_content
+            
+            client.send(response.encode())
+            
         else:
-            resp = "ERR - Unknown Action"
+            # Serve HTML page
+            response = "HTTP/1.1 200 OK\r\n"
+            response += "Content-Type: text/html\r\n"
+            response += "Access-Control-Allow-Origin: *\r\n"
+            response += "Connection: close\r\n\r\n"
+            response += html_content
+            
+            client.send(response.encode())
 
-        _send(client, ctype="text/plain", body=resp)
-        continue
+        client.close()
 
-    # Root page
-    if first.startswith("GET / "):
-        _send(client, ctype="text/html", body=HTML)
-        continue
-
-    # Fallback
-    _send(client, "404 Not Found", "text/plain", "Not Found")
+    except Exception as e:
+        print("Error:", e)
+        try:
+            client.close()
+        except:
+            pass
